@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Uploaded images
+uploads/
+
+# OS / Editor
+.vscode/
+.DS_Store
+# Generated charts
+static/charts/*.png
