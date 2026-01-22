@@ -1,331 +1,592 @@
 import os
 import time
-import base64
-from datetime import datetime
-from collections import Counter
+import json
+from typing import Dict, Any, List, Tuple, Optional
 
 import cv2
 import numpy as np
 import requests
-from flask import Flask, render_template, request, send_from_directory, jsonify
-from werkzeug.utils import secure_filename
+from flask import (
+    Flask,
+    render_template,
+    request,
+    jsonify,
+    redirect,
+    url_for,
+    flash,
+)
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-from fer import FER  # pip install fer
-
+# ------------------------------------------------------------------------------
+# Flask setup
+# ------------------------------------------------------------------------------
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")  # set in Render env
 
-# -----------------------------
-# Paths / config
-# -----------------------------
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-CHART_FOLDER = os.path.join(BASE_DIR, "static", "charts")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(CHART_FOLDER, exist_ok=True)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
+# Where uploaded images are stored (ephemeral on Render free tier; ok for demo)
+UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
+# ------------------------------------------------------------------------------
+# (A) Face detection (OpenCV Haar cascade - lightweight, no heavy ML deps)
+# ------------------------------------------------------------------------------
+# NOTE: Haar cascade ships with opencv; use its default path
+HAAR_PATH = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+face_cascade = cv2.CascadeClassifier(HAAR_PATH)
 
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+# ------------------------------------------------------------------------------
+# (B) Emotion classification
+# ------------------------------------------------------------------------------
+# You had TensorFlow/Torch before; on Render free tier we keep it lightweight.
+# This is a stub you can replace with your own lightweight classifier.
+EMOTION_LABELS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 
-def stamp() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+def predict_emotion_stub(face_bgr: np.ndarray) -> Tuple[str, float]:
+    """
+    Lightweight placeholder that returns a deterministic-ish label & confidence.
+    Replace with your model inference if you have a cloud-friendly approach.
+    """
+    # Simple heuristic: mean intensity -> map to a label just for demo
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    m = float(np.mean(gray))
+    idx = int(m) % len(EMOTION_LABELS)
+    # Confidence as a bounded value
+    conf = 0.55 + (float((int(m) % 45)) / 100.0)  # 0.55..0.99
+    conf = max(0.50, min(0.99, conf))
+    return EMOTION_LABELS[idx], conf
 
-def dataurl_to_bgr(data_url: str):
+def detect_faces_and_emotions(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
+    )
+
+    results: List[Dict[str, Any]] = []
+    for (x, y, w, h) in faces:
+        face_roi = image_bgr[y:y+h, x:x+w]
+        label, conf = predict_emotion_stub(face_roi)
+        results.append(
+            {
+                "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+                "label": label,
+                "confidence": float(round(conf, 2)),
+            }
+        )
+    return results
+
+def draw_detections(image_bgr: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
+    out = image_bgr.copy()
+    for det in detections:
+        x = det["bbox"]["x"]
+        y = det["bbox"]["y"]
+        w = det["bbox"]["w"]
+        h = det["bbox"]["h"]
+        label = det["label"]
+        conf = det["confidence"]
+
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(
+            out,
+            f"{label} ({conf})",
+            (x, max(0, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return out
+
+# ------------------------------------------------------------------------------
+# (C) Optional plots (matplotlib) - safe import (does not crash if missing)
+# ------------------------------------------------------------------------------
+def build_emotion_distribution_plot(detections: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Returns a relative path to a generated PNG under static/, or None if
+    matplotlib is not installed / plot cannot be generated.
+    """
     try:
-        _, encoded = data_url.split(",", 1)
-        img_bytes = base64.b64decode(encoded)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        import matplotlib
+        matplotlib.use("Agg")  # headless backend for servers
+        import matplotlib.pyplot as plt
     except Exception:
         return None
 
-# -----------------------------
-# Emotion model (CPU)
-# -----------------------------
-emotion_detector = FER(mtcnn=False)
+    counts: Dict[str, int] = {k: 0 for k in EMOTION_LABELS}
+    for det in detections:
+        lbl = det.get("label")
+        if lbl in counts:
+            counts[lbl] += 1
 
-# -----------------------------
-# In-memory session stats
-# -----------------------------
-emotion_counter = Counter()
-dominant_history = []
-upload_timestamps = []
+    labels = list(counts.keys())
+    values = [counts[k] for k in labels]
 
-# Last detection for LLM (this is what gets sent LIVE)
-last_detection = {
-    "context": None,          # "upload" or "webcam"
-    "timestamp": None,
-    "faces_detected": 0,
-    "dominant": None,
-    "faces": []               # list of {bbox, label, confidence}
-}
+    fig = plt.figure(figsize=(8, 3))
+    ax = fig.add_subplot(111)
+    ax.bar(labels, values)
+    ax.set_title("Emotion Distribution (Bar)")
+    ax.set_ylabel("Count")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
 
-# -----------------------------
-# Charts
-# -----------------------------
-def _save_fig(fig, filename: str) -> str:
-    path = os.path.join(CHART_FOLDER, filename)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    plot_name = f"emotion_dist_{int(time.time())}.png"
+    plot_path = os.path.join("static", "uploads", plot_name)
+    abs_plot_path = os.path.join(BASE_DIR, plot_path)
+    fig.savefig(abs_plot_path, dpi=150)
     plt.close(fig)
-    return f"charts/{filename}"  # relative to /static
 
-def plot_bar_counts(counter: Counter):
-    if not counter:
-        return None
-    labels = list(counter.keys())
-    values = [counter[k] for k in labels]
-    fig = plt.figure()
-    plt.title("Emotion Distribution (Bar)")
-    plt.xlabel("Emotion")
-    plt.ylabel("Count")
-    plt.bar(labels, values)
-    return _save_fig(fig, f"bar_{int(time.time()*1000)}.png")
+    return plot_path  # relative path usable in <img src="/static/...">
 
-def plot_line_over_time(history, timestamps):
-    if not history or not timestamps or len(history) != len(timestamps):
-        return None
+# ------------------------------------------------------------------------------
+# (D) Hugging Face LLM (Inference API) - optional
+# ------------------------------------------------------------------------------
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_MODEL = os.environ.get("HF_MODEL", "google/flan-t5-base").strip()  # safer default
+HF_API_URL = f"https://api-inference.huggingface.com/models/{HF_MODEL}"
 
-    emotions = sorted(set(history))
-    running = {e: [] for e in emotions}
-    counts = {e: 0 for e in emotions}
+def call_hf_llm(prompt: str, timeout_s: int = 30) -> str:
+    """
+    Calls HF Inference API. Returns text response or raises RuntimeError.
+    """
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not set. Add it in Render Environment variables.")
 
-    for lbl in history:
-        counts[lbl] += 1
-        for e in emotions:
-            running[e].append(counts[e])
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {"inputs": prompt}
 
-    fig = plt.figure()
-    plt.title("Emotion Over Time (Line)")
-    plt.xlabel("Time")
-    plt.ylabel("Cumulative count")
-    for e in emotions:
-        plt.plot(timestamps, running[e], marker="o", label=e)
-    plt.xticks(rotation=45, ha="right")
-    plt.legend()
-    return _save_fig(fig, f"line_{int(time.time()*1000)}.png")
+    r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=timeout_s)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HF error {r.status_code}: {r.text}")
 
-def plot_pie_dominant(counter: Counter):
-    if not counter:
-        return None
-    labels = list(counter.keys())
-    values = [counter[k] for k in labels]
-    fig = plt.figure()
-    plt.title("Dominant Emotions (Pie)")
-    plt.pie(values, labels=labels, autopct="%1.1f%%")
-    return _save_fig(fig, f"pie_{int(time.time()*1000)}.png")
+    data = r.json()
 
-def generate_charts():
-    return (
-        plot_bar_counts(emotion_counter),
-        plot_line_over_time(dominant_history, upload_timestamps),
-        plot_pie_dominant(emotion_counter),
-    )
+    # HF responses vary by model/provider
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
+        return str(data[0]["generated_text"])
+    if isinstance(data, dict) and "generated_text" in data:
+        return str(data["generated_text"])
+    # Fallback
+    return json.dumps(data)[:2000]
 
-# -----------------------------
-# CV inference
-# -----------------------------
-def analyze_image(img_bgr):
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    detections = emotion_detector.detect_emotions(rgb)
-
-    faces = []
-    votes = Counter()
-
-    for d in detections:
-        x, y, w, h = d["box"]
-        emotions = d["emotions"]
-        label = max(emotions, key=emotions.get)
-        conf = float(emotions[label])
-
-        votes[label] += 1
-
-        # draw bounding + label
-        cv2.rectangle(img_bgr, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(img_bgr, f"{label} ({conf:.2f})", (x, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        faces.append({
-            "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-            "label": label,
-            "confidence": conf
-        })
-
-    dominant = votes.most_common(1)[0][0] if faces else None
-    return img_bgr, faces, dominant
-
-def update_memory(context: str, faces: list, dominant: str | None):
-    last_detection["context"] = context
-    last_detection["timestamp"] = stamp()
-    last_detection["faces_detected"] = int(len(faces))
-    last_detection["dominant"] = dominant
-    last_detection["faces"] = faces
-
-    if dominant:
-        emotion_counter[dominant] += 1
-        dominant_history.append(dominant)
-        upload_timestamps.append(last_detection["timestamp"])
-
-# -----------------------------
-# LLM (Ollama local)
-# -----------------------------
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
-
-def build_llm_prompt(user_prompt: str) -> str:
-    # Strict: only use detection data (no hallucinations)
-    return f"""
-Είσαι βοηθός που γράφει σύντομες περιγραφές στα ελληνικά ΜΟΝΟ από δομημένα δεδομένα ανίχνευσης.
-Μην μαντεύεις το περιβάλλον ή αντικείμενα. Μην προσθέτεις πληροφορίες που δεν υπάρχουν.
-
-ΔΕΔΟΜΕΝΑ ΑΝΙΧΝΕΥΣΗΣ:
-- Πηγή: {last_detection.get("context")}
-- Χρόνος: {last_detection.get("timestamp")}
-- Πρόσωπα: {last_detection.get("faces_detected")}
-- Κυρίαρχο συναίσθημα: {last_detection.get("dominant")}
-- Αναλυτικά πρόσωπα: {last_detection.get("faces")}
-
-PROMPT ΧΡΗΣΤΗ:
-{user_prompt}
-
-ΑΠΑΝΤΗΣΗ:
-Γράψε 2–4 προτάσεις στα ελληνικά.
-""".strip()
-
-def call_ollama(prompt: str) -> str:
-    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
-    r = requests.post(OLLAMA_URL, json=payload, timeout=60)
-    r.raise_for_status()
-    return (r.json().get("response") or "").strip()
-
-# -----------------------------
+# ------------------------------------------------------------------------------
 # Routes
-# -----------------------------
-@app.get("/")
-def home():
-    return render_template("index.html", last=last_detection)
+# ------------------------------------------------------------------------------
+# If you already have templates, keep them; otherwise this route still works
+# but will error if templates are missing. You can switch to jsonify-only if needed.
 
-@app.get("/upload")
-def upload_page():
-    return render_template("index.html", last=last_detection)
+@app.get("/")
+def index():
+    """
+    Expects templates/index.html. If you don't have it, create it or change to jsonify.
+    """
+    return render_template("index.html")
 
 @app.post("/upload")
 def upload():
-    start = time.time()
+    """
+    Upload an image, detect faces/emotions, draw boxes, and render a results page.
+    Expects templates/result.html (optional). If missing, returns JSON.
+    """
+    if "image" not in request.files:
+        flash("No file part 'image' found.")
+        return redirect(url_for("index"))
 
-    file = request.files.get("file")
-    if not file or file.filename == "":
-        return render_template("index.html", result="Δεν επιλέχθηκε αρχείο.", last=last_detection)
+    file = request.files["image"]
+    if not file or file.filename.strip() == "":
+        flash("No selected file.")
+        return redirect(url_for("index"))
 
-    if not allowed_file(file.filename):
-        return render_template("index.html", result="Μη έγκυρος τύπος αρχείου.", last=last_detection)
+    # Read image into OpenCV
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        flash("Invalid image format.")
+        return redirect(url_for("index"))
 
-    original_name = secure_filename(file.filename)
-    name = f"{int(time.time()*1000)}_{original_name}"
-    path = os.path.join(UPLOAD_FOLDER, name)
-    file.save(path)
+    detections = detect_faces_and_emotions(image_bgr)
+    annotated = draw_detections(image_bgr, detections)
 
-    img = cv2.imread(path)
-    if img is None:
-        return render_template("index.html", result="Αδυναμία ανάγνωσης εικόνας.", last=last_detection)
+    out_name = f"annotated_{int(time.time())}.jpg"
+    out_rel = os.path.join("static", "uploads", out_name)
+    out_abs = os.path.join(BASE_DIR, out_rel)
+    cv2.imwrite(out_abs, annotated)
 
-    annotated, faces, dominant = analyze_image(img)
-    update_memory("upload", faces, dominant)
+    plot_rel = build_emotion_distribution_plot(detections)
 
-    boxed = f"boxed_{name}"
-    cv2.imwrite(os.path.join(UPLOAD_FOLDER, boxed), annotated)
+    # If you have templates, render them. Otherwise return JSON.
+    try:
+        return render_template(
+            "result.html",
+            image_path="/" + out_rel.replace("\\", "/"),
+            detections=detections,
+            plot_path=("/" + plot_rel.replace("\\", "/")) if plot_rel else None,
+        )
+    except Exception:
+        return jsonify(
+            {
+                "image_path": "/" + out_rel.replace("\\", "/"),
+                "detections": detections,
+                "plot_path": ("/" + plot_rel.replace("\\", "/")) if plot_rel else None,
+                "note": "Templates missing; returning JSON.",
+            }
+        )
 
-    elapsed_ms = (time.time() - start) * 1000.0
-    bar, line, pie = generate_charts()
+@app.post("/api/detect")
+def api_detect():
+    """
+    JSON API variant: send an image file; returns detections only.
+    """
+    if "image" not in request.files:
+        return jsonify({"error": "Missing 'image' file"}), 400
 
-    if not faces:
-        result = f"Faces: 0 | Emotion: not detected | Inference: {elapsed_ms:.1f} ms"
-    else:
-        result = f"Faces: {len(faces)} | Dominant: {dominant} | Inference: {elapsed_ms:.1f} ms"
+    file = request.files["image"]
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        return jsonify({"error": "Invalid image"}), 400
 
-    return render_template(
-        "index.html",
-        filename=boxed,
-        result=result,
-        bar_chart=bar,
-        line_chart=line,
-        pie_chart=pie,
-        last=last_detection
-    )
+    detections = detect_faces_and_emotions(image_bgr)
+    return jsonify({"detections": detections})
 
-@app.post("/predict_frame")
-def predict_frame():
-    start = time.time()
-    data = request.get_json(silent=True) or {}
-    frame_data = data.get("image")
-    if not frame_data:
-        return jsonify({"ok": False, "error": "Missing image"}), 400
-
-    img = dataurl_to_bgr(frame_data)
-    if img is None:
-        return jsonify({"ok": False, "error": "Decode failed"}), 400
-
-    annotated, faces, dominant = analyze_image(img)
-    update_memory("webcam", faces, dominant)
-
-    name = f"webcam_{int(time.time()*1000)}.jpg"
-    cv2.imwrite(os.path.join(UPLOAD_FOLDER, name), annotated)
-
-    elapsed_ms = (time.time() - start) * 1000.0
-    bar, line, pie = generate_charts()
-
-    return jsonify({
-        "ok": True,
-        "faces_detected": int(len(faces)),
-        "dominant": dominant,
-        "elapsed_ms": elapsed_ms,
-        "faces": faces,
-        "annotated_url": f"/uploads/{name}",
-        "charts": {
-            "bar": f"/static/{bar}" if bar else None,
-            "line": f"/static/{line}" if line else None,
-            "pie": f"/static/{pie}" if pie else None
-        },
-        "last": last_detection
-    })
-
-@app.post("/llm_generate")
-def llm_generate():
-    data = request.get_json(silent=True) or {}
-    user_prompt = (data.get("prompt") or "").strip()
+@app.post("/api/llm")
+def api_llm():
+    """
+    LLM endpoint: given last detection summary + user prompt, returns generated text.
+    """
+    body = request.get_json(silent=True) or {}
+    user_prompt = str(body.get("prompt", "")).strip()
+    last_detection = body.get("last_detection", None)
 
     if not user_prompt:
-        return jsonify({"ok": False, "error": "Γράψε ένα prompt πρώτα."}), 400
+        return jsonify({"error": "Missing 'prompt'"}), 400
 
-    if not last_detection.get("timestamp"):
-        return jsonify({"ok": False, "error": "Κάνε πρώτα upload εικόνας ή webcam capture για να υπάρχουν δεδομένα."}), 400
+    # Build a disciplined prompt (works better for instruction models)
+    context = ""
+    if last_detection:
+        context = f"Emotion detection result (JSON): {json.dumps(last_detection, ensure_ascii=False)}\n"
+
+    final_prompt = (
+        "You are an assistant that writes a short, neutral description of what is visible.\n"
+        "If an emotion label is provided, mention it cautiously (e.g., 'appears' or 'seems').\n"
+        "Keep it 1-2 sentences.\n\n"
+        f"{context}"
+        f"User request: {user_prompt}\n"
+        "Answer:"
+    )
 
     try:
-        full_prompt = build_llm_prompt(user_prompt)
-        text = call_ollama(full_prompt)
-        return jsonify({"ok": True, "text": text})
-    except requests.exceptions.ConnectionError:
-        return jsonify({"ok": False, "error": "Δεν τρέχει το Ollama. Άνοιξέ το και ξαναδοκίμασε."}), 500
+        text = call_hf_llm(final_prompt)
+        return jsonify({"text": text, "model": HF_MODEL})
     except Exception as e:
-        return jsonify({"ok": False, "error": f"LLM error: {str(e)}"}), 500
+        return jsonify({"error": str(e), "model": HF_MODEL}), 500
 
-@app.get("/uploads/<path:filename>")
-def uploads(filename):
-    return send_from_directory(UPLOAD_FOLDER, filename)
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
 
+# ------------------------------------------------------------------------------
+# Local development only (Gunicorn on Render will NOT use this block)
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
-
+    # Local debug server
+    app.run(host="127.0.0.1", port=5001, debug=True)
 import os
+import time
+import json
+from typing import Dict, Any, List, Tuple, Optional
 
+import cv2
+import numpy as np
+import requests
+from flask import (
+    Flask,
+    render_template,
+    request,
+    jsonify,
+    redirect,
+    url_for,
+    flash,
+)
+
+# ------------------------------------------------------------------------------
+# Flask setup
+# ------------------------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")  # set in Render env
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Where uploaded images are stored (ephemeral on Render free tier; ok for demo)
+UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ------------------------------------------------------------------------------
+# (A) Face detection (OpenCV Haar cascade - lightweight, no heavy ML deps)
+# ------------------------------------------------------------------------------
+# NOTE: Haar cascade ships with opencv; use its default path
+HAAR_PATH = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+face_cascade = cv2.CascadeClassifier(HAAR_PATH)
+
+# ------------------------------------------------------------------------------
+# (B) Emotion classification
+# ------------------------------------------------------------------------------
+# You had TensorFlow/Torch before; on Render free tier we keep it lightweight.
+# This is a stub you can replace with your own lightweight classifier.
+EMOTION_LABELS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+
+def predict_emotion_stub(face_bgr: np.ndarray) -> Tuple[str, float]:
+    """
+    Lightweight placeholder that returns a deterministic-ish label & confidence.
+    Replace with your model inference if you have a cloud-friendly approach.
+    """
+    # Simple heuristic: mean intensity -> map to a label just for demo
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    m = float(np.mean(gray))
+    idx = int(m) % len(EMOTION_LABELS)
+    # Confidence as a bounded value
+    conf = 0.55 + (float((int(m) % 45)) / 100.0)  # 0.55..0.99
+    conf = max(0.50, min(0.99, conf))
+    return EMOTION_LABELS[idx], conf
+
+def detect_faces_and_emotions(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
+    )
+
+    results: List[Dict[str, Any]] = []
+    for (x, y, w, h) in faces:
+        face_roi = image_bgr[y:y+h, x:x+w]
+        label, conf = predict_emotion_stub(face_roi)
+        results.append(
+            {
+                "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+                "label": label,
+                "confidence": float(round(conf, 2)),
+            }
+        )
+    return results
+
+def draw_detections(image_bgr: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
+    out = image_bgr.copy()
+    for det in detections:
+        x = det["bbox"]["x"]
+        y = det["bbox"]["y"]
+        w = det["bbox"]["w"]
+        h = det["bbox"]["h"]
+        label = det["label"]
+        conf = det["confidence"]
+
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(
+            out,
+            f"{label} ({conf})",
+            (x, max(0, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return out
+
+# ------------------------------------------------------------------------------
+# (C) Optional plots (matplotlib) - safe import (does not crash if missing)
+# ------------------------------------------------------------------------------
+def build_emotion_distribution_plot(detections: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Returns a relative path to a generated PNG under static/, or None if
+    matplotlib is not installed / plot cannot be generated.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless backend for servers
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    counts: Dict[str, int] = {k: 0 for k in EMOTION_LABELS}
+    for det in detections:
+        lbl = det.get("label")
+        if lbl in counts:
+            counts[lbl] += 1
+
+    labels = list(counts.keys())
+    values = [counts[k] for k in labels]
+
+    fig = plt.figure(figsize=(8, 3))
+    ax = fig.add_subplot(111)
+    ax.bar(labels, values)
+    ax.set_title("Emotion Distribution (Bar)")
+    ax.set_ylabel("Count")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+
+    plot_name = f"emotion_dist_{int(time.time())}.png"
+    plot_path = os.path.join("static", "uploads", plot_name)
+    abs_plot_path = os.path.join(BASE_DIR, plot_path)
+    fig.savefig(abs_plot_path, dpi=150)
+    plt.close(fig)
+
+    return plot_path  # relative path usable in <img src="/static/...">
+
+# ------------------------------------------------------------------------------
+# (D) Hugging Face LLM (Inference API) - optional
+# ------------------------------------------------------------------------------
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_MODEL = os.environ.get("HF_MODEL", "google/flan-t5-base").strip()  # safer default
+HF_API_URL = f"https://api-inference.huggingface.com/models/{HF_MODEL}"
+
+def call_hf_llm(prompt: str, timeout_s: int = 30) -> str:
+    """
+    Calls HF Inference API. Returns text response or raises RuntimeError.
+    """
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not set. Add it in Render Environment variables.")
+
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {"inputs": prompt}
+
+    r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=timeout_s)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HF error {r.status_code}: {r.text}")
+
+    data = r.json()
+
+    # HF responses vary by model/provider
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
+        return str(data[0]["generated_text"])
+    if isinstance(data, dict) and "generated_text" in data:
+        return str(data["generated_text"])
+    # Fallback
+    return json.dumps(data)[:2000]
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+# If you already have templates, keep them; otherwise this route still works
+# but will error if templates are missing. You can switch to jsonify-only if needed.
+
+@app.get("/")
+def index():
+    """
+    Expects templates/index.html. If you don't have it, create it or change to jsonify.
+    """
+    return render_template("index.html")
+
+@app.post("/upload")
+def upload():
+    """
+    Upload an image, detect faces/emotions, draw boxes, and render a results page.
+    Expects templates/result.html (optional). If missing, returns JSON.
+    """
+    if "image" not in request.files:
+        flash("No file part 'image' found.")
+        return redirect(url_for("index"))
+
+    file = request.files["image"]
+    if not file or file.filename.strip() == "":
+        flash("No selected file.")
+        return redirect(url_for("index"))
+
+    # Read image into OpenCV
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        flash("Invalid image format.")
+        return redirect(url_for("index"))
+
+    detections = detect_faces_and_emotions(image_bgr)
+    annotated = draw_detections(image_bgr, detections)
+
+    out_name = f"annotated_{int(time.time())}.jpg"
+    out_rel = os.path.join("static", "uploads", out_name)
+    out_abs = os.path.join(BASE_DIR, out_rel)
+    cv2.imwrite(out_abs, annotated)
+
+    plot_rel = build_emotion_distribution_plot(detections)
+
+    # If you have templates, render them. Otherwise return JSON.
+    try:
+        return render_template(
+            "result.html",
+            image_path="/" + out_rel.replace("\\", "/"),
+            detections=detections,
+            plot_path=("/" + plot_rel.replace("\\", "/")) if plot_rel else None,
+        )
+    except Exception:
+        return jsonify(
+            {
+                "image_path": "/" + out_rel.replace("\\", "/"),
+                "detections": detections,
+                "plot_path": ("/" + plot_rel.replace("\\", "/")) if plot_rel else None,
+                "note": "Templates missing; returning JSON.",
+            }
+        )
+
+@app.post("/api/detect")
+def api_detect():
+    """
+    JSON API variant: send an image file; returns detections only.
+    """
+    if "image" not in request.files:
+        return jsonify({"error": "Missing 'image' file"}), 400
+
+    file = request.files["image"]
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        return jsonify({"error": "Invalid image"}), 400
+
+    detections = detect_faces_and_emotions(image_bgr)
+    return jsonify({"detections": detections})
+
+@app.post("/api/llm")
+def api_llm():
+    """
+    LLM endpoint: given last detection summary + user prompt, returns generated text.
+    """
+    body = request.get_json(silent=True) or {}
+    user_prompt = str(body.get("prompt", "")).strip()
+    last_detection = body.get("last_detection", None)
+
+    if not user_prompt:
+        return jsonify({"error": "Missing 'prompt'"}), 400
+
+    # Build a disciplined prompt (works better for instruction models)
+    context = ""
+    if last_detection:
+        context = f"Emotion detection result (JSON): {json.dumps(last_detection, ensure_ascii=False)}\n"
+
+    final_prompt = (
+        "You are an assistant that writes a short, neutral description of what is visible.\n"
+        "If an emotion label is provided, mention it cautiously (e.g., 'appears' or 'seems').\n"
+        "Keep it 1-2 sentences.\n\n"
+        f"{context}"
+        f"User request: {user_prompt}\n"
+        "Answer:"
+    )
+
+    try:
+        text = call_hf_llm(final_prompt)
+        return jsonify({"text": text, "model": HF_MODEL})
+    except Exception as e:
+        return jsonify({"error": str(e), "model": HF_MODEL}), 500
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+# ------------------------------------------------------------------------------
+# Local development only (Gunicorn on Render will NOT use this block)
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # Local debug server
+    app.run(host="127.0.0.1", port=5001, debug=True)
